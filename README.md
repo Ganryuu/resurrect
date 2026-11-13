@@ -1,8 +1,15 @@
 # resurrect
 
-The laptop died in your backpack. `resurrect restore` brings back every gnome-terminal tab,
-every zellij session with its layout, and every coding agent that was running in them, back
-on the conversation it had open, in the same folder:
+Sometimes my battery dies, or I close a terminal window by mistake, and I lose my whole
+setup: the windows, how they were organized, and the agents running in them. `resurrect`
+gets it all back with one command:
+
+```sh
+resurrect restore
+```
+
+Every terminal tab and zellij session reopens, with each coding agent back on the conversation
+it had open:
 
 | Agent       | Reopened with              |
 |-------------|----------------------------|
