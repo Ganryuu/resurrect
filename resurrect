@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """Save and reopen your terminals: gnome-terminal tabs, zellij sessions (with their layout)
-and the Claude Code conversations running in them, which come back with `claude --resume`.
+and the coding agents running in them (Claude Code, Codex, OpenCode), each resumed on the
+conversation it had open.
 
 Usage:
-  resurrect restore [--dry-run]   reopen what the snapshot holds and isn't running now
-  resurrect save                  take a snapshot now
-  resurrect show                  what the snapshot holds
-  resurrect autosave on|off       snapshot every minute in the background (systemd user timer)
+  resurrect restore [N] [--dry-run]   reopen what a snapshot holds and isn't running now
+  resurrect save                      take a snapshot now
+  resurrect show [N]                  the live snapshot and the history, or all of snapshot N
+  resurrect autosave on|off           snapshot every minute in the background (systemd user timer)
 
-Once the terminals have gone down (the battery dying, a reboot, logging out), restore uses the
-last snapshot from before that and reopens every tab; zellij sessions that survived (lingering
-keeps them running through a logout) get a tab attached again. Otherwise it only reopens Claude
-conversations and zellij sessions that were closed. All tabs reopen in one new gnome-terminal window.
+Once the terminals have gone down (the battery dying, a reboot, logging out), their last snapshot
+moves into the history, where later saves can't touch it. restore then reopens every tab of the
+newest one not restored yet, or of snapshot N as numbered by show; zellij sessions that survived
+(lingering keeps them running through a logout) get a tab attached again. With nothing waiting
+to be restored it only reopens agent conversations and zellij sessions that were closed.
+All tabs reopen in one new gnome-terminal window.
 """
 import json
 import os
 import pwd
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -26,24 +30,45 @@ from datetime import datetime
 from pathlib import Path
 
 HOME = Path.home()
+DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
 STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "resurrect"
 CURRENT = STATE / "current.json"
-PREVIOUS = STATE / "previous.json"  # last snapshot before the terminals went down, until restored
-RESTORED = STATE / "previous.restored.json"
+HISTORY = STATE / "history"  # <saved at>.json: the last snapshot of each time the terminals went down
+KEEP = 20  # snapshots in the history
 LAYOUTS = STATE / "layouts"
 CLAUDE_SESSIONS = HOME / ".claude/sessions"  # <pid>.json for every running Claude Code
 CLAUDE_PROJECTS = HOME / ".claude/projects"  # <project>/<session id>.jsonl transcripts
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
+CODEX_SESSIONS = CODEX_HOME / "sessions"  # YYYY/MM/DD/rollout-<time>-<thread id>.jsonl
+CODEX_NAMES = CODEX_HOME / "session_index.jsonl"  # thread names
+OPENCODE_DB = DATA / "opencode/opencode.db"
 UNITS = HOME / ".config/systemd/user"
 UNIT = "resurrect-save"
 SHELL = pwd.getpwuid(os.getuid()).pw_shell or "/bin/bash"
-MARK = "__resurrect_claude__"  # placeholder line in a saved layout, filled in on restore
+MARK = "__resurrect__"  # placeholder line in a saved layout: "<MARK> <agent> <session id or ->"
+OLD_MARK = "__resurrect_claude__"  # the same, in snapshots from before Codex and OpenCode
 
-Proc = namedtuple("Proc", "ppid tpgid start argv")
+AGENTS = ("claude", "codex", "opencode")
+WRAPPERS = {"node", "bun", "deno"}  # what an agent installed from npm runs under
+BATCH = {  # subcommands that aren't the interactive TUI
+    "codex": {"exec", "e", "app-server", "mcp", "mcp-server", "login", "logout", "apply", "a",
+              "completion", "sandbox", "debug", "cloud", "proto", "features", "review", "help"},
+    "opencode": {"run", "serve", "web", "acp", "mcp", "attach", "auth", "models", "session",
+                 "export", "import", "upgrade", "uninstall", "github", "pr", "stats", "agent",
+                 "debug", "generate", "completion", "help"},
+}
+CODEX_TERMINAL = {"codex-tui", "codex_cli_rs"}  # originators of threads started in a terminal
 
-CLAUDE_PANE = re.compile(r'^(\s*)pane command="(?:[^"]*/)?claude"(.*?)(\s*\{)?$')
+Proc = namedtuple("Proc", "ppid tty tpgid start argv")
+
+PANE_COMMAND = re.compile(r'^(\s*)pane command="([^"]*)"(.*?)(\s*\{)?$')
+QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"')
 CWD_ATTR = re.compile(r'\bcwd="([^"]*)"')
 TOP_LEVEL_TAB = re.compile(r"^    tab\b")
 AFTER_TABS = re.compile(r"^    (new_tab_template|swap_tiled_layout|swap_floating_layout)\b")
+PLACEHOLDER = re.compile(rf"^(\s*)(?:{MARK} (\S+)|{OLD_MARK}) (\S+)$", re.M)
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+ROLLOUT = re.compile(rf"/rollout-[^/]*-({UUID.pattern})\.jsonl$")
 
 
 # ---------------------------------------------------------------- reading the live state
@@ -63,10 +88,17 @@ def processes():
             continue
         fields = stat[stat.rindex(")") + 2:].split()  # fields[0] is /proc stat field 3
         table[int(entry.name)] = Proc(
-            ppid=int(fields[1]), tpgid=int(fields[5]), start=int(fields[19]),
+            ppid=int(fields[1]), tty=int(fields[4]), tpgid=int(fields[5]), start=int(fields[19]),
             argv=[a.decode(errors="replace") for a in argv if a],
         )
     return table
+
+
+def started(proc):
+    """When a process started, in seconds since the epoch."""
+    with open("/proc/stat") as stat:
+        boot = next(int(line.split()[1]) for line in stat if line.startswith("btime"))
+    return boot + proc.start / os.sysconf("SC_CLK_TCK")
 
 
 def proc_cwd(pid):
@@ -84,6 +116,67 @@ def proc_env(pid):
     return dict(item.split("=", 1) for item in raw.decode(errors="replace").split("\0") if "=" in item)
 
 
+def open_files(pids):
+    for pid in pids:
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                yield os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                pass
+
+
+def agent_of(argv):
+    """(agent, its arguments) for a command line running one of AGENTS, else (None, [])."""
+    if argv and Path(argv[0]).name in WRAPPERS:  # node /path/to/bin/codex ...
+        argv = next((argv[i:] for i, arg in enumerate(argv[1:], 1) if not arg.startswith("-")), [])
+    name = Path(argv[0]).name if argv else None
+    return (name, argv[1:]) if name in AGENTS else (None, [])
+
+
+def option(args, *names):
+    """The value given to a command-line option, or None."""
+    for i, arg in enumerate(args):
+        for name in names:
+            if arg == name and i + 1 < len(args):
+                return args[i + 1]
+            if name.startswith("--") and arg.startswith(name + "="):
+                return arg[len(name) + 1:]
+    return None
+
+
+def agent_processes(procs, agent):
+    """[(pid, args, cwd, start)] for the interactive `agent` TUIs running in a terminal now."""
+    found = []
+    for pid, proc in procs.items():
+        name, args = agent_of(proc.argv)
+        if name != agent or not proc.tty or BATCH[agent] & set(args):
+            continue
+        parent = procs.get(proc.ppid)
+        if parent and agent_of(parent.argv)[0] == agent:
+            continue  # the native binary under its npm wrapper: the wrapper stands for both
+        found.append((pid, args, proc_cwd(pid) or str(HOME), started(proc)))
+    return found
+
+
+def match_sessions(found, candidates):
+    """Give each running agent in `found` that doesn't know its conversation yet the newest one
+    from `candidates` [(updated, session id, folder, name)], newest first, that was written in its
+    folder since it started. The newest agent picks first."""
+    taken = {entry["session_id"] for entry in found.values()}
+    for entry in sorted(found.values(), key=lambda e: -e["start"]):
+        if entry["session_id"]:
+            continue
+        for updated, session_id, folder, name in candidates:
+            if session_id not in taken and folder == entry["cwd"] and updated >= entry["start"] - 2:
+                entry.update(session_id=session_id, name=name)
+                taken.add(session_id)
+                break
+
+
 def claude_sessions(procs):
     """{pid: conversation} for the interactive Claude Code CLIs running now."""
     found = {}
@@ -99,11 +192,116 @@ def claude_sessions(procs):
         if info.get("kind") != "interactive" or info.get("entrypoint") != "cli" or not info.get("sessionId"):
             continue
         found[info["pid"]] = {
+            "agent": "claude",
             "session_id": info["sessionId"],
             "name": info.get("name") or "",
             "cwd": info.get("cwd") or proc_cwd(info["pid"]) or str(HOME),
         }
     return found
+
+
+def codex_threads(since):
+    """[(updated, thread id, folder, "")], newest first, for Codex threads started in a terminal
+    (not subagents, `codex exec` or the VS Code extension) and written to since `since`."""
+    threads = []
+    for path in CODEX_SESSIONS.glob("*/*/*/rollout-*.jsonl"):
+        try:
+            updated = path.stat().st_mtime
+            if updated < since:
+                continue
+            with path.open() as rollout:
+                meta = json.loads(rollout.readline()).get("payload") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        if meta.get("originator") in CODEX_TERMINAL and isinstance(meta.get("source"), str) and meta.get("id"):
+            threads.append((updated, meta["id"], os.path.realpath(meta.get("cwd") or ""), ""))
+    return sorted(threads, reverse=True)
+
+
+def codex_names():
+    names = {}
+    try:
+        for line in CODEX_NAMES.read_text().splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if entry.get("id") and entry.get("thread_name"):
+                names[entry["id"]] = entry["thread_name"]
+    except OSError:
+        pass
+    return names
+
+
+def codex_sessions(procs):
+    """{pid: conversation} for the Codex TUIs running now.
+
+    A Codex TUI that writes its own thread has the rollout file open, which names it. With the
+    background app-server, the server writes every thread, so the TUI gets the newest terminal
+    thread in its folder that was written since it started."""
+    found = {}
+    for pid, args, cwd, start in agent_processes(procs, "codex"):
+        if folder := option(args, "-C", "--cd"):
+            cwd = os.path.normpath(os.path.join(cwd, folder))
+        session_id = next((m[1] for f in open_files([pid, *(p for p, pr in procs.items() if pr.ppid == pid)])
+                           if (m := ROLLOUT.search(f))), "")
+        if not session_id and "resume" in args:
+            session_id = next((a for a in args[args.index("resume") + 1:] if UUID.fullmatch(a)), "")
+        found[pid] = {"agent": "codex", "session_id": session_id, "name": "", "cwd": os.path.realpath(cwd), "start": start}
+    if found:
+        match_sessions(found, codex_threads(min(e["start"] for e in found.values()) - 5))
+        names = codex_names()
+        for entry in found.values():
+            del entry["start"]
+            entry["name"] = names.get(entry["session_id"], "")
+    return found
+
+
+def opencode_query(sql, params=()):
+    """Rows from OpenCode's session database, or [] when it can't be read."""
+    if not OPENCODE_DB.exists():
+        return []
+    try:
+        db = sqlite3.connect(f"{OPENCODE_DB.as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            return db.execute(sql, params).fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return []
+
+
+def opencode_title(title):
+    return "" if title.startswith("New session - ") else title  # the default, a timestamp
+
+
+def opencode_sessions(procs):
+    """{pid: conversation} for the OpenCode TUIs running now: the session given with --session,
+    or else the newest top-level session in its folder that was updated since it started."""
+    found = {}
+    for pid, args, cwd, start in agent_processes(procs, "opencode"):
+        project = next((a for a in args if not a.startswith("-") and os.path.isdir(os.path.join(cwd, a))), "")
+        found[pid] = {"agent": "opencode", "session_id": option(args, "-s", "--session") or "", "name": "",
+                      "cwd": os.path.realpath(os.path.join(cwd, project)), "start": start}
+    if found:
+        since = min(e["start"] for e in found.values()) - 5
+        rows = opencode_query(
+            "SELECT time_updated / 1000.0, id, directory, title FROM session WHERE parent_id IS NULL"
+            " AND time_archived IS NULL AND time_updated >= ? ORDER BY time_updated DESC", (int(since * 1000),))
+        match_sessions(found, [(t, i, os.path.realpath(d), opencode_title(n)) for t, i, d, n in rows])
+        titles = dict(opencode_query(
+            f"SELECT id, title FROM session WHERE id IN ({','.join('?' * len(found))})",
+            [e["session_id"] for e in found.values()]))
+        for entry in found.values():
+            del entry["start"]
+            entry["name"] = opencode_title(titles.get(entry["session_id"], ""))
+    return found
+
+
+def agent_sessions(procs):
+    """{pid: {agent, session_id, name, cwd}} for every coding agent running in a terminal now.
+    session_id is "" for an agent that hasn't started a conversation."""
+    return {**claude_sessions(procs), **codex_sessions(procs), **opencode_sessions(procs)}
 
 
 def zellij(*args, session=None):
@@ -147,18 +345,28 @@ def zellij_clients():
     return clients
 
 
-def mark_claude_panes(layout, panes):
-    """Swap each claude pane in a dumped zellij layout for a placeholder naming its conversation.
+def pane_agent(command, block_first_line):
+    """Which agent a dumped `pane command=...` runs: the command itself, or for node and the like,
+    the script named first in its args."""
+    name = Path(command).name
+    if name in WRAPPERS and block_first_line.lstrip().startswith("args "):
+        name = next((Path(a).name for a in QUOTED.findall(block_first_line) if not a.startswith("-")), name)
+    return name if name in AGENTS else None
 
-    panes: [{pid, session_id, tab, cwd, x, y, floating}]. A pane is matched on its tab and working
-    directory; several in the same tab and directory are taken in screen order.
+
+def mark_agent_panes(layout, panes):
+    """Swap each agent pane in a dumped zellij layout for a placeholder naming its conversation.
+
+    panes: [{pid, agent, session_id, tab, cwd, x, y, floating}]. A pane is matched on its tab,
+    working directory and agent; several of those are taken in screen order.
     Returns the new layout and the pids that found their pane."""
     queues = {}
     for pane in sorted(panes, key=lambda p: (p["floating"], p["y"], p["x"])):
-        queues.setdefault((pane["tab"], pane["cwd"]), []).append(pane)
+        queues.setdefault((pane["tab"], pane["cwd"], pane["agent"]), []).append(pane)
+    lines = layout.splitlines()
     out, placed = [], set()
     root, tab, tab_cwd, in_tabs, skip_to = "", -1, "", True, None
-    for line in layout.splitlines():
+    for i, line in enumerate(lines):
         if skip_to is not None:  # the old pane's block (args, start_suspended)
             if line == skip_to:
                 skip_to = None
@@ -170,16 +378,18 @@ def mark_claude_panes(layout, panes):
         if in_tabs and TOP_LEVEL_TAB.match(line):
             tab += 1
             tab_cwd = (CWD_ATTR.search(line) or [None, ""])[1]
-        match = CLAUDE_PANE.match(line) if in_tabs else None
+        match = PANE_COMMAND.match(line) if in_tabs else None
         if match:
-            indent, attrs, block = match.groups()
+            indent, command, attrs, block = match.groups()
+            agent = pane_agent(command, lines[i + 1] if block and i + 1 < len(lines) else "")
             pane_cwd = (CWD_ATTR.search(attrs) or [None, ""])[1]
-            queue = queues.get((tab, os.path.normpath(os.path.join(root, tab_cwd, pane_cwd))))
+            queue = agent and queues.get((tab, os.path.normpath(os.path.join(root, tab_cwd, pane_cwd)), agent))
             if queue:
                 pane = queue.pop(0)
                 placed.add(pane["pid"])
                 skip_to = indent + "}" if block else None
-                out += [f'{indent}pane command="{SHELL}"{attrs} {{', f"{indent}    {MARK} {pane['session_id']}", f"{indent}}}"]
+                out += [f'{indent}pane command="{SHELL}"{attrs} {{',
+                        f"{indent}    {MARK} {agent} {pane['session_id'] or '-'}", f"{indent}}}"]
                 continue
         out.append(line)
     return "\n".join(out) + "\n", placed
@@ -187,12 +397,12 @@ def mark_claude_panes(layout, panes):
 
 def snapshot():
     procs = processes()
-    claudes = claude_sessions(procs)
+    agents = agent_sessions(procs)
     alive = [name for name, up in zellij_sessions().items() if up]
 
-    # zellij sessions: the layout as zellij dumps it, with each claude pane tied to its conversation
+    # zellij sessions: the layout as zellij dumps it, with each agent pane tied to its conversation
     in_zellij = {}
-    for pid in claudes:
+    for pid in agents:
         env = proc_env(pid)
         if env.get("ZELLIJ_SESSION_NAME") in alive and env.get("ZELLIJ_PANE_ID", "").isdigit():
             in_zellij.setdefault(env["ZELLIJ_SESSION_NAME"], []).append((int(env["ZELLIJ_PANE_ID"]), pid))
@@ -205,31 +415,32 @@ def snapshot():
             continue
         geometry = {p["id"]: p for p in json.loads(listed.stdout) if not p.get("is_plugin")}
         panes = [
-            {"pid": pid, "session_id": claudes[pid]["session_id"], "tab": g["tab_position"],
-             "cwd": proc_cwd(pid), "x": g["pane_x"], "y": g["pane_y"], "floating": g["is_floating"]}
+            {"pid": pid, "agent": agents[pid]["agent"], "session_id": agents[pid]["session_id"],
+             "tab": g["tab_position"], "cwd": proc_cwd(pid), "x": g["pane_x"], "y": g["pane_y"],
+             "floating": g["is_floating"]}
             for pane_id, pid in in_zellij.get(name, []) if (g := geometry.get(pane_id))
         ]
-        layout, found = mark_claude_panes(dumped.stdout, panes)
-        layouts[name] = {"layout": layout, "claude": [claudes[pid] for pid in found]}
+        layout, found = mark_agent_panes(dumped.stdout, panes)
+        layouts[name] = {"layout": layout, "agents": [agents[pid] for pid in found]}
         placed |= found
 
     # gnome-terminal tabs, oldest first: each one's shell is a direct child of gnome-terminal-server
     servers = {pid for pid, p in procs.items() if p.argv and p.argv[0].endswith("gnome-terminal-server")}
     shells = sorted((pid for pid, p in procs.items() if p.ppid in servers), key=lambda pid: procs[pid].start)
-    claude_in_tab = {}
-    for pid in sorted(set(claudes) - placed, key=lambda pid: procs[pid].start):
+    agent_in_tab = {}
+    for pid in sorted(set(agents) - placed, key=lambda pid: procs[pid].start):
         ancestor = procs[pid].ppid
         while ancestor > 1 and ancestor not in shells:
             ancestor = procs[ancestor].ppid if ancestor in procs else 1
         if ancestor in shells:
-            claude_in_tab.setdefault(ancestor, pid)
+            agent_in_tab.setdefault(ancestor, pid)
 
     tabs, clients = [], None
     for shell in shells:
         foreground = procs.get(procs[shell].tpgid)
-        if shell in claude_in_tab:
-            pid = claude_in_tab[shell]
-            tabs.append({"kind": "claude", **claudes[pid]})
+        if shell in agent_in_tab:
+            pid = agent_in_tab[shell]
+            tabs.append(agent_tab(agents[pid]))
             placed.add(pid)
         elif foreground and foreground.argv and Path(foreground.argv[0]).name == "zellij":
             clients = zellij_clients() if clients is None else clients
@@ -238,18 +449,28 @@ def snapshot():
                 tabs.append({"kind": "zellij", "session": name})
         else:
             tabs.append({"kind": "shell", "cwd": proc_cwd(shell) or str(HOME)})
-    # Detached zellij sessions and Claude running anywhere else (VS Code terminal, ...) go last.
+    # Detached zellij sessions and agents running anywhere else (VS Code terminal, ...) go last.
     tabs += [{"kind": "zellij", "session": n} for n in layouts if not any(t.get("session") == n for t in tabs)]
-    tabs += [{"kind": "claude", **claudes[pid]} for pid in claudes if pid not in placed]
+    tabs += [agent_tab(agents[pid]) for pid in agents if pid not in placed]
 
     return {
-        "version": 1,
+        "version": 2,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "boot_id": boot_id(),
         "terminal": ",".join(f"{pid}:{procs[pid].start}" for pid in sorted(servers)) or None,
         "tabs": tabs,
         "zellij": layouts,
     }
+
+
+def agent_tab(entry):
+    """A snapshot tab for an agent: its kind is the agent's name."""
+    return {"kind": entry["agent"], **{k: v for k, v in entry.items() if k != "agent"}}
+
+
+def zellij_agents(saved):
+    """The agents a saved zellij session holds, also from snapshots that only knew Claude."""
+    return saved.get("agents") or [{"agent": "claude", **c} for c in saved.get("claude", [])]
 
 
 # ---------------------------------------------------------------- snapshots on disk
@@ -266,7 +487,7 @@ def read_json(path):
 
 
 def write_json(path, data):
-    STATE.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=1))
     os.replace(tmp, path)
@@ -281,61 +502,103 @@ def process_alive(pid_start):
     return stat[stat.rindex(")") + 2:].split()[19] == start
 
 
+def set_aside(snap, pending=True):
+    """Add a snapshot to the history; `pending` until a restore, which then picks it by default."""
+    write_json(HISTORY / f"{snap['saved_at']}.json", {**snap, "pending": pending})
+    for old in sorted(HISTORY.glob("*.json"))[:-KEEP]:
+        old.unlink()
+
+
+def history():
+    """[(path, snapshot)] of the history, newest first."""
+    found = [(path, read_json(path)) for path in sorted(HISTORY.glob("*.json"), reverse=True)]
+    return [(path, snap) for path, snap in found if snap]
+
+
 def rotate():
-    """Once the terminals of the last snapshot are gone (reboot, logout, crash), set that
-    snapshot aside, so new saves can't overwrite it."""
+    """Once the terminals of the live snapshot are gone (reboot, logout, crash), move it into
+    the history, so new saves can't overwrite it."""
+    for name, pending in (("previous.json", True), ("previous.restored.json", False)):
+        if old := read_json(STATE / name):  # from before there was a history
+            set_aside(old, pending)
+        (STATE / name).unlink(missing_ok=True)
     snap = read_json(CURRENT)
     if not snap:
         return
     servers = (snap.get("terminal") or "").split(",")
-    if snap.get("boot_id") != boot_id() or not all(process_alive(s) for s in servers if s):
-        os.replace(CURRENT, PREVIOUS)
+    if snap.get("boot_id") == boot_id() and all(process_alive(s) for s in servers if s):
+        return
+    # Nothing but shells in the home folder is a terminal opened and closed again: not worth
+    # a place in the history, and it mustn't become what restore picks.
+    if not all(tab["kind"] == "shell" and tab["cwd"] == str(HOME) for tab in snap["tabs"]):
+        set_aside(snap)
+    CURRENT.unlink()
 
 
 # ---------------------------------------------------------------- reopening
 
-def claude_command(session_id):
-    """Shell command that brings a conversation back, then leaves a shell behind like before."""
-    has_transcript = any(CLAUDE_PROJECTS.glob(f"*/{session_id}.jsonl"))
-    claude = f"claude --resume {shlex.quote(session_id)}" if has_transcript else "claude"
-    return f"{claude}; exec {shlex.quote(SHELL)}"
+def resume_command(agent, session_id):
+    """Shell command that brings an agent back on its conversation, then leaves a shell behind
+    like before. A conversation that has since been deleted gets a fresh start."""
+    quoted = shlex.quote(session_id)
+    if agent == "claude" and session_id and any(CLAUDE_PROJECTS.glob(f"*/{session_id}.jsonl")):
+        command = f"claude --resume {quoted}"
+    elif agent == "codex" and session_id and any(CODEX_SESSIONS.glob(f"*/*/*/rollout-*-{session_id}.jsonl")):
+        command = f"codex resume {quoted}"
+    elif agent == "opencode" and session_id and opencode_query("SELECT 1 FROM session WHERE id = ?", (session_id,)):
+        command = f"opencode --session {quoted}"
+    else:
+        command = agent
+    return f"{command}; exec {shlex.quote(SHELL)}"
 
 
 def render_layout(layout, skip):
     """Fill the placeholders of a saved layout; conversations in `skip` are already open elsewhere."""
     def fill(match):
-        indent, session_id = match.groups()
-        if session_id in skip:
+        indent, agent, session_id = match.groups()
+        agent, session_id = agent or "claude", "" if session_id == "-" else session_id
+        if session_id and (agent, session_id) in skip:
             return ""  # just a shell in that pane
-        skip.add(session_id)
-        return f'{indent}args "-ic" {json.dumps(claude_command(session_id))}'
-    return re.sub(rf"^(\s*){MARK} (\S+)$", fill, layout, flags=re.M)
+        skip.add((agent, session_id))
+        return f'{indent}args "-ic" {json.dumps(resume_command(agent, session_id))}'
+    return PLACEHOLDER.sub(fill, layout)
+
+
+def label(entry):
+    return f"{entry['agent']:<10}{entry.get('name') or entry.get('session_id') or '(new)'}"
 
 
 def plan_restore(snap, terminals_gone):
     """[(label, cwd, shell command or None)] for every tab to open, plus zellij layouts to write."""
     procs = processes()
-    opened = {c["session_id"] for c in claude_sessions(procs).values()}
+    opened = {(a["agent"], a["session_id"]) for a in agent_sessions(procs).values() if a["session_id"]}
     sessions = zellij_sessions()
     tabs, layouts = [], {}
     for tab in snap["tabs"]:
-        if tab["kind"] == "shell" and terminals_gone:
+        kind = tab["kind"]
+        if kind == "shell" and terminals_gone:
             tabs.append(("shell", tab["cwd"], None))
-        elif tab["kind"] == "claude" and tab["session_id"] not in opened:
-            opened.add(tab["session_id"])
-            tabs.append((f"claude  {tab['name'] or tab['session_id']}", tab["cwd"], claude_command(tab["session_id"])))
-        elif tab["kind"] == "zellij" and sessions.get(tab["session"]):
+        elif kind in AGENTS:
+            entry = {"agent": kind, **tab}
+            key = (kind, tab.get("session_id") or "")
+            # One with no conversation can't be told apart from a running one; reopen it only
+            # once everything went down.
+            if (key[1] or terminals_gone) and key not in opened:
+                if key[1]:
+                    opened.add(key)
+                tabs.append((label(entry), tab["cwd"], resume_command(*key)))
+        elif kind == "zellij" and sessions.get(tab["session"]):
             # Still running (it outlived the terminals): attach a tab again unless one is attached.
             clients = zellij("action", "list-clients", session=tab["session"]).stdout.splitlines()[1:]
             if terminals_gone and not any(line.strip() for line in clients):
                 command = f"zellij attach {shlex.quote(tab['session'])}; exec {shlex.quote(SHELL)}"
-                tabs.append((f"zellij  {tab['session']}  (attach)", str(HOME), command))
-        elif tab["kind"] == "zellij":
+                tabs.append((f"{'zellij':<10}{tab['session']}  (attach)", str(HOME), command))
+        elif kind == "zellij":
             name, saved = tab["session"], snap["zellij"][tab["session"]]
             layouts[name] = render_layout(saved["layout"], opened)
-            names = ", ".join(c["name"] or c["session_id"][:8] for c in saved["claude"])
+            names = ", ".join(a["agent"] + " " + (a["name"] or a["session_id"][:8] or "(new)") for a in zellij_agents(saved))
             command = f"zellij --session {shlex.quote(name)} --new-session-with-layout {shlex.quote(str(LAYOUTS / f'{name}.kdl'))}; exec {shlex.quote(SHELL)}"
-            tabs.append((f"zellij  {name}" + (f"  ({names})" if names else ""), str(HOME), command))
+            tabs.append((f"{'zellij':<10}{name}" + (f"  ({names})" if names else ""), str(HOME), command))
     return tabs, layouts, sessions
 
 
@@ -354,11 +617,11 @@ def open_tabs(tabs):
 def describe(tab, snap):
     where = lambda path: path.replace(str(HOME), "~", 1)
     if tab["kind"] == "shell":
-        return f"shell   {where(tab['cwd'])}"
-    if tab["kind"] == "claude":
-        return f"claude  {tab['name'] or tab['session_id']}  {where(tab['cwd'])}"
-    names = ", ".join(c["name"] or c["session_id"][:8] for c in snap["zellij"][tab["session"]]["claude"])
-    return f"zellij  {tab['session']}" + (f"  (claude: {names})" if names else "")
+        return f"{'shell':<10}{where(tab['cwd'])}"
+    if tab["kind"] in AGENTS:
+        return f"{label({'agent': tab['kind'], **tab})}  {where(tab['cwd'])}"
+    names = ", ".join(f"{a['agent']}: {a['name'] or a['session_id'][:8] or '(new)'}" for a in zellij_agents(snap["zellij"][tab["session"]]))
+    return f"{'zellij':<10}{tab['session']}" + (f"  ({names})" if names else "")
 
 
 def cmd_save(auto=False):
@@ -373,51 +636,92 @@ def cmd_save(auto=False):
             print(f"  {describe(tab, snap)}")
 
 
-def cmd_show():
+def when(snap):
+    return snap["saved_at"].replace("T", " ")[:16]
+
+
+def cmd_show(pick=None):
     rotate()
-    for path, label in ((PREVIOUS, "from before the terminals went down, not restored yet"), (CURRENT, "live")):
-        snap = read_json(path)
-        if not snap:
-            continue
-        print(f"Snapshot {snap['saved_at'].replace('T', ' ')[:16]}  ({label})")
+    past = history()
+    if pick is not None:
+        snap = chosen(past, pick)[1]
+        print(f"Snapshot {pick}, {when(snap)}")
         for tab in snap["tabs"]:
             print(f"  {describe(tab, snap)}")
+        return
+    live = read_json(CURRENT)
+    if live:
+        print(f"Live snapshot {when(live)}")
+        for tab in live["tabs"]:
+            print(f"  {describe(tab, live)}")
         print()
-    if not PREVIOUS.exists() and not CURRENT.exists():
+    if past:
+        print("History, from before the terminals went down ('resurrect show N', 'resurrect restore N'):")
+        for n, (_path, snap) in enumerate(past, 1):
+            print(history_line(n, snap))
+        print()
+    if not live and not past:
         print("No snapshot yet: run 'resurrect save'.\n")
     on = subprocess.run(["systemctl", "--user", "is-active", "--quiet", f"{UNIT}.timer"]).returncode == 0
     print(f"Autosave: {'on, every minute' if on else 'off'}")
 
 
-def cmd_restore(dry_run=False):
+def history_line(n, snap):
+    agents = sum(t["kind"] in AGENTS for t in snap["tabs"]) + sum(len(zellij_agents(z)) for z in snap["zellij"].values())
+    plural = lambda count, word: f"{count:>2} {word}{'' if count == 1 else 's'}"
+    return (f"  {n:>2}  {when(snap)}  {plural(len(snap['tabs']), 'tab')}, {plural(agents, 'agent').strip()}"
+            + ("  (not restored yet)" if snap.get("pending") else ""))
+
+
+def chosen(past, pick):
+    if not 1 <= pick <= len(past):
+        sys.exit(f"No snapshot {pick} in the history: see 'resurrect show'.")
+    return past[pick - 1]
+
+
+def cmd_restore(pick=None, dry_run=False):
     rotate()
-    terminals_gone = PREVIOUS.exists()
-    snap = read_json(PREVIOUS if terminals_gone else CURRENT)
-    if not snap:
-        print("No snapshot to restore. Run 'resurrect save' or 'resurrect autosave on' first.")
+    past = history()
+    pending = [entry for entry in past if entry[1].get("pending")]
+    if pick is not None:
+        snap = chosen(past, pick)[1]
+    elif len(pending) > 1:  # the newest may be a few tabs opened in between: don't guess
+        print("More than one snapshot hasn't been restored. Pick one with 'resurrect restore N':")
+        for n, (_path, snap) in enumerate(past, 1):
+            if snap.get("pending"):
+                print(history_line(n, snap).replace("  (not restored yet)", ""))
         return
+    elif pending:
+        snap = pending[0][1]
+    else:
+        snap = read_json(CURRENT)
+        if not snap:
+            print("No snapshot to restore. Run 'resurrect save' or 'resurrect autosave on' first.")
+            return
+    terminals_gone = pick is not None or bool(pending)
     tabs, layouts, sessions = plan_restore(snap, terminals_gone)
-    when = snap["saved_at"].replace("T", " ")[:16]
-    if not tabs:
-        print(f"Everything from the {when} snapshot is already open.")
-        return
-    print(f"{'Would reopen' if dry_run else 'Reopening'} {len(tabs)} tabs from the {when} snapshot:")
-    for label, cwd, _ in tabs:
-        print(f"  {label}" if label.startswith("zellij") else f"  {label}  {cwd.replace(str(HOME), '~', 1)}")
+    if tabs:
+        print(f"{'Would reopen' if dry_run else 'Reopening'} {len(tabs)} tabs from the {when(snap)} snapshot:")
+        for name, cwd, _ in tabs:
+            print(f"  {name}" if name.startswith("zellij") else f"  {name}  {cwd.replace(str(HOME), '~', 1)}")
+    else:
+        print(f"Everything from the {when(snap)} snapshot is already open.")
     if dry_run:
         return
-    LAYOUTS.mkdir(parents=True, exist_ok=True)
-    for name, layout in layouts.items():
-        if name in sessions:  # an exited copy zellij kept; the saved layout replaces it
-            zellij("delete-session", name)
-        (LAYOUTS / f"{name}.kdl").write_text(layout)
-    open_tabs(tabs)
-    if terminals_gone:
-        os.replace(PREVIOUS, RESTORED)
+    if tabs:
+        LAYOUTS.mkdir(parents=True, exist_ok=True)
+        for name, layout in layouts.items():
+            if name in sessions:  # an exited copy zellij kept; the saved layout replaces it
+                zellij("delete-session", name)
+            (LAYOUTS / f"{name}.kdl").write_text(layout)
+        open_tabs(tabs)
+    if terminals_gone:  # settled: the next restore is about what's live again
+        for path, other in pending:
+            write_json(path, {k: v for k, v in other.items() if k != "pending"})
 
 
 SERVICE = f"""[Unit]
-Description=Snapshot terminals and Claude Code sessions for resurrect
+Description=Snapshot terminals and coding-agent sessions for resurrect
 
 [Service]
 Type=oneshot
@@ -425,7 +729,7 @@ ExecStart={Path(__file__).resolve()} save --auto
 """
 
 TIMER = """[Unit]
-Description=Snapshot terminals and Claude Code sessions every minute
+Description=Snapshot terminals and coding-agent sessions every minute
 
 [Timer]
 OnStartupSec=1min
@@ -457,12 +761,13 @@ def cmd_autosave(state):
 if __name__ == "__main__":
     args = sys.argv[1:]
     command = args[0] if args else "show"
+    pick = next((int(arg) for arg in args[1:] if arg.isdigit()), None)
     if command == "save":
         cmd_save(auto="--auto" in args)
     elif command == "restore":
-        cmd_restore(dry_run="--dry-run" in args or "-n" in args)
+        cmd_restore(pick, dry_run="--dry-run" in args or "-n" in args)
     elif command == "show":
-        cmd_show()
+        cmd_show(pick)
     elif command == "autosave":
         cmd_autosave(args[1] if len(args) > 1 else "")
     else:
